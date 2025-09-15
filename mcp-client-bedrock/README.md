@@ -62,3 +62,24 @@ Configure these in the `.env` file:
 - Connects to MCP servers to access their tools
 - Uses AWS Bedrock to interact with Claude models
 - Supports tool use for enhanced capabilities
+
+# MCP Client Bedrock Setup
+
+## Setup Steps
+
+1. Clone the repository.
+2. Navigate to the `mcp-client-bedrock` folder.
+3. Create a `.env` file in this folder.
+4. Add your AWS credentials and region to the `.env` file as shown below.
+5. Install dependencies and run the project as needed.
+
+## .env File Example
+
+```
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your-access-key-id
+AWS_SECRET_ACCESS_KEY=your-secret-access-key
+```
+
+- Replace `your-access-key-id` and `your-secret-access-key` with your actual AWS credentials.
+- Do not commit your `.env` file to version control.

@@ -28,12 +28,13 @@ class MCPClient {
   private transport: StdioClientTransport | null = null;
   private tools: Tool[] = [];
   private modelId: string = "anthropic.claude-3-sonnet-20240229-v1:0"; // Updated model ID
-  private inferenceProfileId: string | null = null;
+  private inferenceProfileId: string = "us.anthropic.claude-opus-4-1-20250805-v1:0";
 
   constructor(inferenceProfileId?: string) {
     this.bedrockClient = new BedrockRuntimeClient({ region: AWS_REGION});
     this.mcp = new Client({ name: "mcp-client-bedrock", version: "1.0.0" });
   }
+
 
   async connectToServer(serverScriptPath: string) {
     try {
@@ -58,7 +59,7 @@ class MCPClient {
       this.tools = toolsResult.tools.map((tool) => {
         return {
           name: tool.name,
-          description: tool.description || "",  // Ensure description is never undefined
+          description: tool.description || "",
           input_schema: tool.inputSchema,
         };
       });
@@ -115,7 +116,9 @@ class MCPClient {
       accept: "application/json",
       body: JSON.stringify(payload)
     };
-    
+    if (this.inferenceProfileId) {
+      commandParams.inferenceProfileArn = this.inferenceProfileId;
+    }
     const command = new InvokeModelCommand(commandParams);
 
     try {
@@ -135,12 +138,65 @@ class MCPClient {
           const toolName = content.name;
           const toolArgs = content.input;
 
-          // Call the MCP tool
-          const result = await this.mcp.callTool({
-            name: toolName,
-            arguments: toolArgs,
-          });
-          
+          // Detect partition key for the table (default: "id")
+          const partitionKey = "id"; // Change this if your table uses a different partition key
+
+          // Check if partition key is present in keyConditionExpression
+          const missingPartitionKey =
+            !toolArgs.keyConditionExpression ||
+            !toolArgs.expressionAttributeValues ||
+            Object.keys(toolArgs.expressionAttributeValues).length === 0 ||
+            !new RegExp(`\\b${partitionKey}\\b|#${partitionKey}\\b`).test(toolArgs.keyConditionExpression);
+
+          const isInvalidKeyCondition =
+            missingPartitionKey ||
+            /[<>!=]/.test(toolArgs.keyConditionExpression);
+
+          let result;
+          if (toolName === "query_table" && isInvalidKeyCondition) {
+            // Fallback to scan_table if partition key is missing or invalid
+            const scanArgs: any = {
+              tableName: toolArgs.tableName,
+              filterExpression: toolArgs.filterExpression || toolArgs.keyConditionExpression,
+              expressionAttributeNames: toolArgs.expressionAttributeNames,
+              expressionAttributeValues: toolArgs.expressionAttributeValues,
+              limit: toolArgs.limit,
+            };
+            result = await this.mcp.callTool({
+              name: "scan_table",
+              arguments: scanArgs,
+            });
+            toolResults.push(result);
+            finalText.push(
+              `[Calling tool scan_table with args ${JSON.stringify(scanArgs)}]`
+            );
+          } else {
+            result = await this.mcp.callTool({
+              name: toolName,
+              arguments: toolArgs,
+            });
+            toolResults.push(result);
+            finalText.push(
+              `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
+            );
+          }
+
+          // --- Print actual items to terminal if present ---
+          try {
+            let parsed: any = null;
+            if (typeof result.content === "string") {
+              parsed = JSON.parse(result.content);
+            } else if (Array.isArray(result.content) && result.content.length > 0 && typeof result.content[0]?.text === "string") {
+              parsed = JSON.parse(result.content[0].text);
+            }
+            if (parsed && parsed.items && Array.isArray(parsed.items)) {
+              console.log("\n--- Actual items from tool ---");
+              console.log(JSON.stringify(parsed.items, null, 2));
+              console.log("--- End items ---\n");
+            }
+          } catch {}
+          // -------------------------------------------------
+
           toolResults.push(result);
           finalText.push(
             `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
@@ -158,17 +214,32 @@ class MCPClient {
               } as any
             ]
           });
-          
+
           // Add the tool result as a tool_result type
           const toolResultContent = typeof result.content === 'string' ? result.content : JSON.stringify(result.content);
-          
+
+          // --- FIX: Add the actual items to the user message for follow-up ---
+          let itemsText = "";
+          try {
+            let parsed: any = null;
+            if (typeof result.content === "string") {
+              parsed = JSON.parse(result.content);
+            } else if (Array.isArray(result.content) && result.content.length > 0 && typeof result.content[0]?.text === "string") {
+              parsed = JSON.parse(result.content[0].text);
+            }
+            if (parsed && parsed.items) {
+              itemsText = "\nActual items:\n" + JSON.stringify(parsed.items, null, 2);
+            }
+          } catch {}
+          // ---------------------------------------------------------------
+
           messages.push({
             role: "user",
             content: [
               {
                 type: "tool_result",
                 tool_use_id: content.id,
-                content: toolResultContent
+                content: toolResultContent + itemsText // <-- append actual items
               } as any
             ]
           });
@@ -218,12 +289,15 @@ class MCPClient {
   
     try {
       console.log("\nMCP Client with Bedrock Started with Bedrock!");
-      console.log("Type your queries or 'quit' to exit.");
+      console.log("Type your queries, 'tools' to list tools, or 'quit' to exit.");
   
       while (true) {
         const message = await rl.question("\nQuery: ");
         if (message.toLowerCase() === "quit") {
           break;
+        }
+        if (message.toLowerCase() === "tools") {
+          continue;
         }
         const response = await this.processQuery(message);
         console.log("\n" + response);
@@ -245,7 +319,7 @@ async function main() {
   }
   
   // Get the inference profile ID from command line arguments if provided
-  const inferenceProfileId = process.argv.length >= 4 ? process.argv[3] : null;
+  const inferenceProfileId = "us.anthropic.claude-opus-4-1-20250805-v1:0";
   
   const mcpClient = new MCPClient(inferenceProfileId || undefined);
   
