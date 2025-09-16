@@ -22,18 +22,16 @@ import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
 
 
 // AWS client initialization
-const region = process.env.AWS_REGION;
+
 const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
 const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
-const sessionToken = process.env.AWS_SESSION_TOKEN;
 
 const dynamoClient = new DynamoDBClient({
-  region,
-  credentials: accessKeyId && secretAccessKey ? {
-    accessKeyId,
-    secretAccessKey,
-    sessionToken
-  } : undefined,
+  region: process.env.AWS_REGION,
+  // Only pass credentials if both are present and non-empty
+  ...(accessKeyId && secretAccessKey
+    ? { credentials: { accessKeyId, secretAccessKey } }
+    : {}),
 });
 
 // Define tools
@@ -571,6 +569,22 @@ async function scanTable(params: any) {
         else if (val.B !== undefined) exprAttrVals[key] = val.B;
       }
     });
+
+    // Remove unused ExpressionAttributeNames keys
+    if (params.expressionAttributeNames) {
+      const exprs = [
+        params.filterExpression,
+        params.keyConditionExpression
+      ].filter(e => typeof e === "string").join(" ");
+      Object.keys(params.expressionAttributeNames).forEach(key => {
+        if (!exprs.includes(key)) {
+          delete params.expressionAttributeNames[key];
+        }
+      });
+      if (Object.keys(params.expressionAttributeNames).length === 0) {
+        delete params.expressionAttributeNames;
+      }
+    }
 
     // Validate ExpressionAttributeNames
     if (params.expressionAttributeNames) {

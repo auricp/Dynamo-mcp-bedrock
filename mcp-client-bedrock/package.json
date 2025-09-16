@@ -4,7 +4,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "build": "tsc && shx chmod +x build/*.js",
+    "build": "shx rm -rf build && tsc && shx chmod +x build/*.js",
     "test": "node test-bedrock.js"
   },
   "keywords": [],

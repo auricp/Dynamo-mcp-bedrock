@@ -28,7 +28,7 @@ class MCPClient {
   private transport: StdioClientTransport | null = null;
   private tools: Tool[] = [];
   private modelId: string = "anthropic.claude-3-sonnet-20240229-v1:0"; // Updated model ID
-  private inferenceProfileId: string = "us.anthropic.claude-opus-4-1-20250805-v1:0";
+  private inferenceProfileId: string | null = null;
 
   constructor(inferenceProfileId?: string) {
     this.bedrockClient = new BedrockRuntimeClient({ region: AWS_REGION});
