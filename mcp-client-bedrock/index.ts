@@ -15,245 +15,274 @@ if (!AWS_REGION) {
   throw new Error("AWS_REGION is not set in .env file");
 }
 
-// Define tool interface similar to Anthropic's
+// Enhanced tool interface with better typing
 interface Tool {
   name: string;
   description: string | undefined;
   input_schema: object;
 }
 
-class MCPClient {
+interface ConversationMessage {
+  role: "user" | "assistant";
+  content: Array<{
+    type: "text" | "tool_use" | "tool_result";
+    text?: string;
+    id?: string;
+    name?: string;
+    input?: any;
+    tool_use_id?: string;
+    content?: string;
+  }>;
+}
+
+class EnhancedMCPClient {
   private mcp: Client;
   private bedrockClient: BedrockRuntimeClient;
   private transport: StdioClientTransport | null = null;
   private tools: Tool[] = [];
-  private modelId: string = "anthropic.claude-3-sonnet-20240229-v1:0"; // Updated model ID
+  private modelId: string = "anthropic.claude-3-sonnet-20240229-v1:0";
   private inferenceProfileId: string | null = null;
+  private conversationHistory: ConversationMessage[] = [];
+  private sanitizedToOriginalToolName: Record<string, string> = {};
 
   constructor(inferenceProfileId?: string) {
-    this.bedrockClient = new BedrockRuntimeClient({ region: AWS_REGION});
-    this.mcp = new Client({ name: "mcp-client-bedrock", version: "1.0.0" });
+    this.bedrockClient = new BedrockRuntimeClient({ region: AWS_REGION });
+    this.mcp = new Client({ name: "enhanced-mcp-client", version: "1.0.0" });
+    this.inferenceProfileId = inferenceProfileId || null;
   }
-
 
   async connectToServer(serverScriptPath: string) {
     try {
       const isJs = serverScriptPath.endsWith(".js");
       const isPy = serverScriptPath.endsWith(".py");
+      
       if (!isJs && !isPy) {
         throw new Error("Server script must be a .js or .py file");
       }
+      
       const command = isPy
-        ? process.platform === "win32"
-          ? "python"
-          : "python3"
+        ? process.platform === "win32" ? "python" : "python3"
         : process.execPath;
-  
+
       this.transport = new StdioClientTransport({
         command,
         args: [serverScriptPath],
       });
-      this.mcp.connect(this.transport);
-  
+      
+      await this.mcp.connect(this.transport);
+
       const toolsResult = await this.mcp.listTools();
-      this.tools = toolsResult.tools.map((tool) => {
-        return {
-          name: tool.name,
-          description: tool.description || "",
-          input_schema: tool.inputSchema,
-        };
-      });
-      console.log(
-        "Connected to server with tools:",
-        this.tools.map(({ name }) => name)
-      );
+      this.tools = toolsResult.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description || "",
+        input_schema: tool.inputSchema,
+      }));
+      // Build mapping from sanitized to original tool names
+      this.sanitizedToOriginalToolName = {};
+      for (const tool of this.tools) {
+        this.sanitizedToOriginalToolName[this.sanitizeToolName(tool.name)] = tool.name;
+      }
+      
+      console.log("\n🔗 Connected to DynamoDB MCP Server");
+      console.log(`📊 Available tools: ${this.tools.length}`);
+      console.log("🛠️  Tools:", this.tools.map(({ name }) => `\n   - ${name}`).join(''));
+      console.log("");
+      
     } catch (e) {
-      console.log("Failed to connect to MCP server: ", e);
+      console.error("❌ Failed to connect to MCP server:", e);
       throw e;
     }
   }
 
-  async processQuery(query: string) {
-    // Create the initial message
-    const messages = [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: query
+  // Enhanced query optimization - smarter tool selection
+  private optimizeQuery(toolName: string, toolArgs: any): { name: string; args: any } {
+    // If querying without a proper partition key condition, prefer scan
+    if (toolName === "dynamodb:query_table") {
+      const keyCondition = toolArgs.keyConditionExpression || "";
+      
+      // Check if the key condition seems to be missing partition key
+      // This is a heuristic - in practice, you'd want more sophisticated parsing
+      if (keyCondition.includes("Age") && !keyCondition.includes("Name") && !keyCondition.includes("#name")) {
+        console.log("🔄 Optimizing: Converting query to scan (missing partition key condition)");
+        return {
+          name: "dynamodb:scan_table",
+          args: {
+            tableName: toolArgs.tableName,
+            filterExpression: toolArgs.keyConditionExpression,
+            expressionAttributeNames: toolArgs.expressionAttributeNames,
+            expressionAttributeValues: toolArgs.expressionAttributeValues,
+            limit: toolArgs.limit,
           }
-        ]
+        };
       }
-    ];
+    }
+    
+    return { name: toolName, args: toolArgs };
+  }
 
-    // Prepare tools for Bedrock format if available
+  // Utility to sanitize tool names for Bedrock
+  private sanitizeToolName(name: string): string {
+    return name.replace(/[^a-zA-Z0-9_-]/g, '_');
+  }
+
+  async processQuery(query: string): Promise<string> {
+    // Add user message to conversation history
+    const userMessage: ConversationMessage = {
+      role: "user",
+      content: [{ type: "text", text: query }]
+    };
+    
+    this.conversationHistory.push(userMessage);
+
+    // Prepare tools for Bedrock format
     const toolsForBedrock = this.tools.length > 0 ? {
       tools: this.tools.map(tool => ({
-        name: tool.name,
-        description: tool.description || "",  // Ensure description is never undefined
+        name: this.sanitizeToolName(tool.name),
+        description: tool.description || "",
         input_schema: tool.input_schema
       }))
     } : {};
 
-    // Create the request payload
+    // Create the request payload with conversation history
     const payload = {
-
       anthropic_version: "bedrock-2023-05-31",
-      max_tokens: 1000,
+      max_tokens: 2000,
       top_k: 250,
       stop_sequences: [],
-      temperature: 0.7,
+      temperature: 0.1, // Lower temperature for more consistent responses
       top_p: 0.999,
-      messages: messages,
+      messages: [...this.conversationHistory],
       ...toolsForBedrock
     };
 
-    // Invoke the Bedrock model
     const commandParams: any = {
       modelId: this.modelId,
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify(payload)
     };
+
     if (this.inferenceProfileId) {
       commandParams.inferenceProfileArn = this.inferenceProfileId;
     }
+
     const command = new InvokeModelCommand(commandParams);
 
     try {
       const response = await this.bedrockClient.send(command);
-      
-      // Parse the response
       const responseBody = JSON.parse(new TextDecoder().decode(response.body));
       
-      const finalText = [];
-      const toolResults = [];
+      const finalText: string[] = [];
+      const assistantContent: any[] = [];
 
       // Process the response content
       for (const content of responseBody.content) {
         if (content.type === "text") {
           finalText.push(content.text);
+          assistantContent.push(content);
         } else if (content.type === "tool_use") {
-          const toolName = content.name;
-          const toolArgs = content.input;
+          // Optimize the tool call
+          const optimized = this.optimizeQuery(content.name, content.input);
+          const sanitizedToolName = this.sanitizeToolName(optimized.name);
+          // Map sanitized name back to original for MCP call
+          const mcpToolName = this.sanitizedToOriginalToolName[sanitizedToolName] || optimized.name;
+          
+          console.log(`\n🔧 Executing: ${optimized.name}`);
+          console.log(`📝 Args: ${JSON.stringify(optimized.args, null, 2)}`);
 
-          // Detect partition key for the table (default: "id")
-          const partitionKey = "id"; // Change this if your table uses a different partition key
-
-          // Check if partition key is present in keyConditionExpression
-          const missingPartitionKey =
-            !toolArgs.keyConditionExpression ||
-            !toolArgs.expressionAttributeValues ||
-            Object.keys(toolArgs.expressionAttributeValues).length === 0 ||
-            !new RegExp(`\\b${partitionKey}\\b|#${partitionKey}\\b`).test(toolArgs.keyConditionExpression);
-
-          const isInvalidKeyCondition =
-            missingPartitionKey ||
-            /[<>!=]/.test(toolArgs.keyConditionExpression);
-
+          // Execute the tool
           let result;
-          if (toolName === "query_table" && isInvalidKeyCondition) {
-            // Fallback to scan_table if partition key is missing or invalid
-            const scanArgs: any = {
-              tableName: toolArgs.tableName,
-              filterExpression: toolArgs.filterExpression || toolArgs.keyConditionExpression,
-              expressionAttributeNames: toolArgs.expressionAttributeNames,
-              expressionAttributeValues: toolArgs.expressionAttributeValues,
-              limit: toolArgs.limit,
-            };
+          try {
             result = await this.mcp.callTool({
-              name: "scan_table",
-              arguments: scanArgs,
+              name: mcpToolName,
+              arguments: optimized.args,
             });
-            toolResults.push(result);
-            finalText.push(
-              `[Calling tool scan_table with args ${JSON.stringify(scanArgs)}]`
-            );
-          } else {
-            result = await this.mcp.callTool({
-              name: toolName,
-              arguments: toolArgs,
-            });
-            toolResults.push(result);
-            finalText.push(
-              `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
-            );
+          } catch (err) {
+            const errorMsg = `❌ Tool ${sanitizedToolName} failed: ${err}`;
+            console.error(errorMsg);
+            finalText.push(errorMsg);
+            continue;
           }
 
-          // --- Print actual items to terminal if present ---
-          try {
-            let parsed: any = null;
-            if (typeof result.content === "string") {
-              parsed = JSON.parse(result.content);
-            } else if (Array.isArray(result.content) && result.content.length > 0 && typeof result.content[0]?.text === "string") {
-              parsed = JSON.parse(result.content[0].text);
-            }
-            if (parsed && parsed.items && Array.isArray(parsed.items)) {
-              console.log("\n--- Actual items from tool ---");
-              console.log(JSON.stringify(parsed.items, null, 2));
-              console.log("--- End items ---\n");
-            }
-          } catch {}
-          // -------------------------------------------------
-
-          toolResults.push(result);
-          finalText.push(
-            `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
-          );
-
-          // Add the tool result to messages for follow-up
-          messages.push({
-            role: "assistant",
-            content: [
-              {
-                type: "tool_use",
-                id: content.id,
-                name: toolName,
-                input: toolArgs
-              } as any
-            ]
+          // Add tool use to assistant content (sanitize name)
+          assistantContent.push({
+            type: "tool_use",
+            id: content.id,
+            name: sanitizedToolName,
+            input: optimized.args
           });
 
-          // Add the tool result as a tool_result type
-          const toolResultContent = typeof result.content === 'string' ? result.content : JSON.stringify(result.content);
-
-          // --- FIX: Add the actual items to the user message for follow-up ---
-          let itemsText = "";
+          // Parse and display results
+          let parsedResult: any = null;
+          let resultText = "";
+          
           try {
-            let parsed: any = null;
             if (typeof result.content === "string") {
-              parsed = JSON.parse(result.content);
+              parsedResult = JSON.parse(result.content);
             } else if (Array.isArray(result.content) && result.content.length > 0 && typeof result.content[0]?.text === "string") {
-              parsed = JSON.parse(result.content[0].text);
+              parsedResult = JSON.parse(result.content[0].text);
             }
-            if (parsed && parsed.items) {
-              itemsText = "\nActual items:\n" + JSON.stringify(parsed.items, null, 2);
-            }
-          } catch {}
-          // ---------------------------------------------------------------
+          } catch (parseError) {
+            console.error("Error parsing tool result:", parseError);
+          }
 
-          messages.push({
+          if (parsedResult) {
+            resultText = JSON.stringify(parsedResult, null, 2);
+            
+            // Display results in a user-friendly way
+            if (parsedResult.success) {
+              console.log(`✅ ${parsedResult.message}`);
+              
+              if (parsedResult.items && Array.isArray(parsedResult.items)) {
+                console.log(`📊 Found ${parsedResult.items.length} items:`);
+                if (parsedResult.items.length > 0) {
+                  console.log(JSON.stringify(parsedResult.items, null, 2));
+                }
+              }
+              
+              if (parsedResult.item) {
+                console.log("📄 Item:", JSON.stringify(parsedResult.item, null, 2));
+              }
+              
+              if (parsedResult.tables) {
+                console.log(`📋 Tables (${parsedResult.tableCount}):`, parsedResult.tables);
+              }
+            } else {
+              console.log(`❌ ${parsedResult.message}`);
+              if (parsedResult.errorType) {
+                console.log(`🔍 Error Type: ${parsedResult.errorType}`);
+              }
+            }
+          }
+
+          // Add tool result to conversation (do NOT include name)
+          const toolResultContent: ConversationMessage = {
             role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: content.id,
-                content: toolResultContent + itemsText // <-- append actual items
-              } as any
-            ]
-          });
+            content: [{
+              type: "tool_result",
+              tool_use_id: content.id,
+              content: resultText
+            }]
+          };
 
-          // Create a follow-up request with the tool result
+          // Update conversation history
+          this.conversationHistory.push({
+            role: "assistant",
+            content: assistantContent
+          });
+          
+          this.conversationHistory.push(toolResultContent);
+
+          // Create follow-up request to get the model's interpretation
           const followUpPayload = {
             anthropic_version: "bedrock-2023-05-31",
             max_tokens: 1000,
             top_k: 250,
             stop_sequences: [],
-            temperature: 0.7,
+            temperature: 0.1,
             top_p: 0.999,
-            messages: messages,
-            tools: this.tools.length > 0 ? toolsForBedrock.tools : undefined
+            messages: [...this.conversationHistory],
+            tools: toolsForBedrock.tools
           };
 
           const followUpCommandParams: any = {
@@ -262,22 +291,33 @@ class MCPClient {
             accept: "application/json",
             body: JSON.stringify(followUpPayload)
           };
-          
-          const followUpCommand = new InvokeModelCommand(followUpCommandParams);
 
+          if (this.inferenceProfileId) {
+            followUpCommandParams.inferenceProfileArn = this.inferenceProfileId;
+          }
+
+          const followUpCommand = new InvokeModelCommand(followUpCommandParams);
           const followUpResponse = await this.bedrockClient.send(followUpCommand);
           const followUpBody = JSON.parse(new TextDecoder().decode(followUpResponse.body));
           
           if (followUpBody.content && followUpBody.content[0] && followUpBody.content[0].type === "text") {
-            finalText.push(followUpBody.content[0].text);
+            const interpretationText = followUpBody.content[0].text;
+            finalText.push(interpretationText);
+            
+            // Add the follow-up response to conversation history
+            this.conversationHistory.push({
+              role: "assistant",
+              content: [{ type: "text", text: interpretationText }]
+            });
           }
         }
       }
 
       return finalText.join("\n");
-    } catch (error) {
-      console.error("Error invoking Bedrock model:", error);
-      return `Error: ${error instanceof Error ? error.message : String(error)}`;
+      
+    } catch (error: any) {
+      console.error("❌ Error invoking Bedrock model:", error);
+      return `Error: ${error.message || error}`;
     }
   }
 
@@ -286,56 +326,109 @@ class MCPClient {
       input: process.stdin,
       output: process.stdout,
     });
-  
+
     try {
-      console.log("\nMCP Client with Bedrock Started with Bedrock!");
-      console.log("Type your queries, 'tools' to list tools, or 'quit' to exit.");
-  
+      console.log("\n" + "=".repeat(60));
+      console.log("🚀 Enhanced DynamoDB MCP Client with Bedrock");
+      console.log("=".repeat(60));
+      console.log("Commands:");
+      console.log("  📝 Type your queries about DynamoDB");
+      console.log("  🛠️  'tools' - list available tools");
+      console.log("  🧹 'clear' - clear conversation history");
+      console.log("  ❌ 'quit' - exit the application");
+      console.log("=".repeat(60));
+
       while (true) {
-        const message = await rl.question("\nQuery: ");
+        const message = await rl.question("\n💬 Query: ");
+        
         if (message.toLowerCase() === "quit") {
+          console.log("👋 Goodbye!");
           break;
         }
-        if (message.toLowerCase() === "tools") {
+        
+        if (message.toLowerCase() === "clear") {
+          this.conversationHistory = [];
+          console.log("🧹 Conversation history cleared!");
           continue;
         }
+        
+        if (message.toLowerCase() === "tools") {
+          console.log("\n🛠️  Available tools:");
+          this.tools.forEach(tool => {
+            console.log(`   📌 ${tool.name}`);
+            console.log(`      ${tool.description}`);
+          });
+          continue;
+        }
+
+        if (message.trim() === "") {
+          continue;
+        }
+
+        console.log("\n" + "-".repeat(50));
         const response = await this.processQuery(message);
-        console.log("\n" + response);
+        console.log("\n🤖 Assistant:", response);
+        console.log("-".repeat(50));
       }
     } finally {
       rl.close();
     }
   }
-  
+
   async cleanup() {
-    await this.mcp.close();
+    try {
+      await this.mcp.close();
+      console.log("🧹 MCP connection closed successfully");
+    } catch (error) {
+      console.error("❌ Error closing MCP connection:", error);
+    }
   }
 }
 
 async function main() {
   if (process.argv.length < 3) {
-    console.log("Usage: node index.ts <path_to_server_script> [inference_profile_id]");
+    console.log("Usage: node enhanced-client.js <path_to_server_script> [inference_profile_id]");
+    console.log("\nExample:");
+    console.log("  node enhanced-client.js ./dynamodb-server.js");
+    console.log("  node enhanced-client.js ./dynamodb-server.js us.anthropic.claude-opus-4-1-20250805-v1:0");
     return;
   }
-  
+
   // Get the inference profile ID from command line arguments if provided
-  const inferenceProfileId = "us.anthropic.claude-opus-4-1-20250805-v1:0";
+  const inferenceProfileId = process.argv[3] || "us.anthropic.claude-opus-4-1-20250805-v1:0";
   
-  const mcpClient = new MCPClient(inferenceProfileId || undefined);
+  const mcpClient = new EnhancedMCPClient(inferenceProfileId);
+  
+  console.log("🚀 Starting Enhanced DynamoDB MCP Client...");
   
   if (inferenceProfileId) {
-    console.log(`Using inference profile ID: ${inferenceProfileId}`);
+    console.log(`🧠 Using inference profile: ${inferenceProfileId}`);
   } else {
-    console.log("No inference profile ID provided. Using model ID directly.");
+    console.log("🧠 Using direct model ID (no inference profile)");
   }
-  
+
   try {
     await mcpClient.connectToServer(process.argv[2]);
     await mcpClient.chatLoop();
+  } catch (error) {
+    console.error("❌ Fatal error:", error);
   } finally {
     await mcpClient.cleanup();
     process.exit(0);
   }
 }
 
-main();
+// Enhanced error handling
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection:', reason);
+});
+
+main().catch(error => {
+  console.error("❌ Fatal error in main:", error);
+  process.exit(1);
+});
