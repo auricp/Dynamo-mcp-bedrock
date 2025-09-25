@@ -3,6 +3,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import readline from "readline/promises";
 import dotenv from "dotenv";
+import express from "express";
+import bodyParser from "body-parser";
 dotenv.config();
 // Check for AWS region
 const AWS_REGION = process.env.AWS_REGION;
@@ -314,16 +316,57 @@ class EnhancedMCPClient {
         }
     }
 }
+let mcpClientInstance = null;
+export async function initMCPClient(serverScriptPath, inferenceProfileId) {
+    if (!mcpClientInstance) {
+        mcpClientInstance = new EnhancedMCPClient(inferenceProfileId);
+        await mcpClientInstance.connectToServer(serverScriptPath);
+    }
+    return mcpClientInstance;
+}
+export async function mcpProcessQuery(query) {
+    if (!mcpClientInstance) {
+        throw new Error("MCP client not initialized. Call initMCPClient first.");
+    }
+    return await mcpClientInstance.processQuery(query);
+}
+async function startEndpoint(serverScriptPath, inferenceProfileId) {
+    const mcpClient = new EnhancedMCPClient(inferenceProfileId);
+    await mcpClient.connectToServer(serverScriptPath);
+    const app = express();
+    app.use(bodyParser.json());
+    app.post("/query", async (req, res) => {
+        const { query } = req.body;
+        if (!query || typeof query !== "string") {
+            return res.status(400).json({ error: "Missing or invalid 'query' field in request body." });
+        }
+        try {
+            const response = await mcpClient.processQuery(query);
+            res.json({ result: response });
+        }
+        catch (err) {
+            res.status(500).json({ error: err.message || err });
+        }
+    });
+    const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+    app.listen(port, () => {
+        console.log(`🚀 MCP HTTP endpoint listening on port ${port}`);
+    });
+}
 async function main() {
     if (process.argv.length < 3) {
-        console.log("Usage: node enhanced-client.js <path_to_server_script> [inference_profile_id]");
-        console.log("\nExample:");
-        console.log("  node enhanced-client.js ./dynamodb-server.js");
-        console.log("  node enhanced-client.js ./dynamodb-server.js us.anthropic.claude-opus-4-1-20250805-v1:0");
+        console.log("Usage:");
+        console.log("  node index.js <path_to_server_script> [inference_profile_id]");
+        console.log("  node index.js <path_to_server_script> [inference_profile_id] endpoint");
         return;
     }
-    // Get the inference profile ID from command line arguments if provided
+    const serverScriptPath = process.argv[2];
     const inferenceProfileId = process.argv[3] || "us.anthropic.claude-opus-4-1-20250805-v1:0";
+    const mode = process.argv[4];
+    if (mode === "endpoint") {
+        await startEndpoint(serverScriptPath, inferenceProfileId);
+        return;
+    }
     const mcpClient = new EnhancedMCPClient(inferenceProfileId);
     console.log("🚀 Starting Enhanced DynamoDB MCP Client...");
     if (inferenceProfileId) {
@@ -333,7 +376,7 @@ async function main() {
         console.log("🧠 Using direct model ID (no inference profile)");
     }
     try {
-        await mcpClient.connectToServer(process.argv[2]);
+        await mcpClient.connectToServer(serverScriptPath);
         await mcpClient.chatLoop();
     }
     catch (error) {

@@ -6,14 +6,31 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import readline from "readline/promises";
 import dotenv from "dotenv";
+import express from "express";
+import bodyParser from "body-parser";
+import type { Request, Response } from "express";
 
-dotenv.config();
 
-// Check for AWS region
+// Load environment variables with explicit path
+const envResult = dotenv.config({ path: '.env' });
+console.log('dotenv config result:', envResult);
+
+// Check for AWS region with better debugging
 const AWS_REGION = process.env.AWS_REGION;
+console.log('All environment variables:', {
+  AWS_REGION: process.env.AWS_REGION,
+  NODE_ENV: process.env.NODE_ENV,
+  PORT: process.env.PORT
+});
+
 if (!AWS_REGION) {
-  throw new Error("AWS_REGION is not set in .env file");
+  console.error("Environment variables check failed:");
+  console.error("AWS_REGION:", process.env.AWS_REGION);
+  console.error("All env keys:", Object.keys(process.env).filter(key => key.startsWith('AWS')));
+  throw new Error("AWS_REGION is not set in environment variables");
 }
+
+console.log(`Using AWS Region: ${AWS_REGION}`);
 
 // Enhanced tool interface with better typing
 interface Tool {
@@ -125,14 +142,17 @@ class EnhancedMCPClient {
     return name.replace(/[^a-zA-Z0-9_-]/g, '_');
   }
 
-  async processQuery(query: string): Promise<string> {
-    // Add user message to conversation history
+  async processQuery(query: string, stateless: boolean = false): Promise<string> {
     const userMessage: ConversationMessage = {
       role: "user",
       content: [{ type: "text", text: query }]
     };
-    
-    this.conversationHistory.push(userMessage);
+
+    // For stateless requests, do NOT use or push to conversationHistory
+    const messages = stateless ? [userMessage] : (() => {
+      this.conversationHistory.push(userMessage);
+      return [...this.conversationHistory];
+    })();
 
     // Prepare tools for Bedrock format
     const toolsForBedrock = this.tools.length > 0 ? {
@@ -149,9 +169,9 @@ class EnhancedMCPClient {
       max_tokens: 2000,
       top_k: 250,
       stop_sequences: [],
-      temperature: 0.1, // Lower temperature for more consistent responses
+      temperature: 0.1,
       top_p: 0.999,
-      messages: [...this.conversationHistory],
+      messages,
       ...toolsForBedrock
     };
 
@@ -171,11 +191,108 @@ class EnhancedMCPClient {
     try {
       const response = await this.bedrockClient.send(command);
       const responseBody = JSON.parse(new TextDecoder().decode(response.body));
-      
+
+      // For stateless requests, handle tool calls with a follow-up request
+      if (stateless) {
+        let finalText: string[] = [];
+        let toolUseContent: any = null;
+        let toolResultContent: any = null;
+        let toolUseId: string | undefined;
+
+        for (const content of responseBody.content) {
+          if (content.type === "text") {
+            finalText.push(content.text);
+          } else if (content.type === "tool_use") {
+            toolUseContent = content;
+            toolUseId = content.id;
+
+            // Execute the tool
+            const optimized = this.optimizeQuery(content.name, content.input);
+            const sanitizedToolName = this.sanitizeToolName(optimized.name);
+            const mcpToolName = this.sanitizedToOriginalToolName[sanitizedToolName] || optimized.name;
+
+            let result;
+            try {
+              result = await this.mcp.callTool({
+                name: mcpToolName,
+                arguments: optimized.args,
+              });
+            } catch (err) {
+              return `❌ Tool ${sanitizedToolName} failed: ${err}`;
+            }
+
+            // Parse tool result
+            let parsedResult: any = null;
+            let resultText = "";
+            try {
+              if (typeof result.content === "string") {
+                parsedResult = JSON.parse(result.content);
+              } else if (Array.isArray(result.content) && result.content.length > 0 && typeof result.content[0]?.text === "string") {
+                parsedResult = JSON.parse(result.content[0].text);
+              }
+            } catch (parseError) {}
+
+            if (parsedResult) {
+              resultText = JSON.stringify(parsedResult, null, 2);
+            }
+
+            toolResultContent = {
+              type: "tool_result",
+              tool_use_id: toolUseId,
+              content: resultText
+            };
+
+            // Now, send a follow-up request with the correct alternation:
+            const followUpMessages: ConversationMessage[] = [
+              userMessage,
+              { role: "assistant", content: [toolUseContent] },
+              { role: "user", content: [toolResultContent] }
+            ];
+
+            const followUpPayload = {
+              anthropic_version: "bedrock-2023-05-31",
+              max_tokens: 1000,
+              top_k: 250,
+              stop_sequences: [],
+              temperature: 0.1,
+              top_p: 0.999,
+              messages: followUpMessages,
+              tools: this.tools.map(tool => ({
+                name: this.sanitizeToolName(tool.name),
+                description: tool.description || "",
+                input_schema: tool.input_schema
+              }))
+            };
+
+            const followUpCommandParams: any = {
+              modelId: this.modelId,
+              contentType: "application/json",
+              accept: "application/json",
+              body: JSON.stringify(followUpPayload)
+            };
+
+            if (this.inferenceProfileId) {
+              followUpCommandParams.inferenceProfileArn = this.inferenceProfileId;
+            }
+
+            const followUpCommand = new InvokeModelCommand(followUpCommandParams);
+            const followUpResponse = await this.bedrockClient.send(followUpCommand);
+            const followUpBody = JSON.parse(new TextDecoder().decode(followUpResponse.body));
+
+            // Return only the assistant's final text
+            for (const followContent of followUpBody.content) {
+              if (followContent.type === "text") {
+                finalText.push(followContent.text);
+              }
+            }
+          }
+        }
+        return finalText.join("\n");
+      }
+
+      // ...existing code for non-stateless (chat) usage
       const finalText: string[] = [];
       const assistantContent: any[] = [];
-
-      // Process the response content
       for (const content of responseBody.content) {
         if (content.type === "text") {
           finalText.push(content.text);
@@ -229,7 +346,7 @@ class EnhancedMCPClient {
           if (parsedResult) {
             resultText = JSON.stringify(parsedResult, null, 2);
             
-            // Display results in a user-friendly way
+            // Display results in a user-friendly way (console)
             if (parsedResult.success) {
               console.log(`✅ ${parsedResult.message}`);
               
@@ -253,68 +370,15 @@ class EnhancedMCPClient {
                 console.log(`🔍 Error Type: ${parsedResult.errorType}`);
               }
             }
-          }
-
-          // Add tool result to conversation (do NOT include name)
-          const toolResultContent: ConversationMessage = {
-            role: "user",
-            content: [{
-              type: "tool_result",
-              tool_use_id: content.id,
-              content: resultText
-            }]
-          };
-
-          // Update conversation history
-          this.conversationHistory.push({
-            role: "assistant",
-            content: assistantContent
-          });
-          
-          this.conversationHistory.push(toolResultContent);
-
-          // Create follow-up request to get the model's interpretation
-          const followUpPayload = {
-            anthropic_version: "bedrock-2023-05-31",
-            max_tokens: 1000,
-            top_k: 250,
-            stop_sequences: [],
-            temperature: 0.1,
-            top_p: 0.999,
-            messages: [...this.conversationHistory],
-            tools: toolsForBedrock.tools
-          };
-
-          const followUpCommandParams: any = {
-            modelId: this.modelId,
-            contentType: "application/json",
-            accept: "application/json",
-            body: JSON.stringify(followUpPayload)
-          };
-
-          if (this.inferenceProfileId) {
-            followUpCommandParams.inferenceProfileArn = this.inferenceProfileId;
-          }
-
-          const followUpCommand = new InvokeModelCommand(followUpCommandParams);
-          const followUpResponse = await this.bedrockClient.send(followUpCommand);
-          const followUpBody = JSON.parse(new TextDecoder().decode(followUpResponse.body));
-          
-          if (followUpBody.content && followUpBody.content[0] && followUpBody.content[0].type === "text") {
-            const interpretationText = followUpBody.content[0].text;
-            finalText.push(interpretationText);
-            
-            // Add the follow-up response to conversation history
-            this.conversationHistory.push({
-              role: "assistant",
-              content: [{ type: "text", text: interpretationText }]
-            });
+            // Always add resultText to finalText for endpoint response
+            finalText.push(resultText);
           }
         }
       }
 
+      // For stateless requests, do not update conversationHistory
       return finalText.join("\n");
-      
+
     } catch (error: any) {
       console.error("❌ Error invoking Bedrock model:", error);
       return `Error: ${error.message || error}`;
@@ -383,24 +447,79 @@ class EnhancedMCPClient {
       console.error("❌ Error closing MCP connection:", error);
     }
   }
+
+  // Add this method
+  resetConversationHistory() {
+    this.conversationHistory = [];
+  }
+}
+
+let mcpClientInstance: EnhancedMCPClient | null = null;
+
+export async function initMCPClient(serverScriptPath: string, inferenceProfileId?: string) {
+  if (!mcpClientInstance) {
+    mcpClientInstance = new EnhancedMCPClient(inferenceProfileId);
+    await mcpClientInstance.connectToServer(serverScriptPath);
+  }
+  return mcpClientInstance;
+}
+
+export async function mcpProcessQuery(query: string, stateless: boolean = false): Promise<string> {
+  if (!mcpClientInstance) {
+    throw new Error("MCP client not initialized. Call initMCPClient first.");
+  }
+  return await mcpClientInstance.processQuery(query, stateless);
+}
+
+async function startEndpoint(serverScriptPath: string, inferenceProfileId?: string) {
+  const mcpClient = new EnhancedMCPClient(inferenceProfileId);
+  await mcpClient.connectToServer(serverScriptPath);
+
+  const app = express();
+  app.use(bodyParser.json());
+
+  app.post("/query", async (req: Request, res: Response) => {
+    // Reset conversation history for every request to ensure statelessness
+    mcpClient.resetConversationHistory();
+    const { query } = req.body;
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({ error: "Missing or invalid 'query' field in request body." });
+    }
+    try {
+      const response = await mcpClient.processQuery(query);
+      res.json({ result: response });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || err });
+    }
+  });
+
+  const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+  app.listen(port, () => {
+    console.log(`🚀 MCP HTTP endpoint listening on port ${port}`);
+  });
 }
 
 async function main() {
   if (process.argv.length < 3) {
-    console.log("Usage: node enhanced-client.js <path_to_server_script> [inference_profile_id]");
-    console.log("\nExample:");
-    console.log("  node enhanced-client.js ./dynamodb-server.js");
-    console.log("  node enhanced-client.js ./dynamodb-server.js us.anthropic.claude-opus-4-1-20250805-v1:0");
+    console.log("Usage:");
+    console.log("  node index.js <path_to_server_script> [inference_profile_id]");
+    console.log("  node index.js <path_to_server_script> [inference_profile_id] endpoint");
     return;
   }
 
-  // Get the inference profile ID from command line arguments if provided
+  const serverScriptPath = process.argv[2];
   const inferenceProfileId = process.argv[3] || "us.anthropic.claude-opus-4-1-20250805-v1:0";
-  
+  const mode = process.argv[4];
+
+  if (mode === "endpoint") {
+    await startEndpoint(serverScriptPath, inferenceProfileId);
+    return;
+  }
+
   const mcpClient = new EnhancedMCPClient(inferenceProfileId);
-  
+
   console.log("🚀 Starting Enhanced DynamoDB MCP Client...");
-  
+
   if (inferenceProfileId) {
     console.log(`🧠 Using inference profile: ${inferenceProfileId}`);
   } else {
@@ -408,7 +527,7 @@ async function main() {
   }
 
   try {
-    await mcpClient.connectToServer(process.argv[2]);
+    await mcpClient.connectToServer(serverScriptPath);
     await mcpClient.chatLoop();
   } catch (error) {
     console.error("❌ Fatal error:", error);
