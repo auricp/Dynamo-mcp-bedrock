@@ -11,7 +11,6 @@ let mcpModule = null;
 // Initialize MCP client once at startup
 (async () => {
     try {
-        // Use dynamic import for ES module
         mcpModule = await import('./mcp-client-bedrock/build/index.js');
         
         const serverScriptPath = path.resolve(__dirname, './mcp-dynamo/dist/index.js');
@@ -23,7 +22,7 @@ let mcpModule = null;
         console.error("Failed to initialize MCP client:", err);
     }
 })();
-
+/*
 app.post('/query', async (req, res) => {
     if (!mcpReady || !mcpModule) {
         return res.status(503).json({ error: 'MCP client not ready.' });
@@ -51,8 +50,8 @@ app.post('/query', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-
-// Add a debug endpoint that captures console output
+*/
+// change from normal query (will change name later) to output only important info
 app.post('/query-debug', async (req, res) => {
     if (!mcpReady || !mcpModule) {
         return res.status(503).json({ error: 'MCP client not ready.' });
