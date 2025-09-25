@@ -17,11 +17,6 @@ console.log('dotenv config result:', envResult);
 
 // Check for AWS region with better debugging
 const AWS_REGION = process.env.AWS_REGION;
-console.log('All environment variables:', {
-  AWS_REGION: process.env.AWS_REGION,
-  NODE_ENV: process.env.NODE_ENV,
-  PORT: process.env.PORT
-});
 
 if (!AWS_REGION) {
   console.error("Environment variables check failed:");

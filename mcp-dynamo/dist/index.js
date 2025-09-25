@@ -2,7 +2,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
-import { DynamoDBClient, CreateTableCommand, ListTablesCommand, DescribeTableCommand, UpdateTableCommand, PutItemCommand, GetItemCommand, UpdateItemCommand, QueryCommand, ScanCommand, DeleteItemCommand, } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, ListTablesCommand, DescribeTableCommand, GetItemCommand, QueryCommand, ScanCommand, } from "@aws-sdk/client-dynamodb";
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
 // AWS client initialization
 const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
@@ -13,24 +13,6 @@ const dynamoClient = new DynamoDBClient({
         ? { credentials: { accessKeyId, secretAccessKey } }
         : {}),
 });
-// Enhanced tool definitions with better descriptions and examples
-const DYNAMODB_CREATE_TABLE_TOOL = {
-    name: "dynamodb:create_table",
-    description: "Creates a new DynamoDB table with specified configuration",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table to create" },
-            partitionKey: { type: "string", description: "Name of the partition key" },
-            partitionKeyType: { type: "string", enum: ["S", "N", "B"], description: "Type of partition key (S=String, N=Number, B=Binary)" },
-            sortKey: { type: "string", description: "Name of the sort key (optional)" },
-            sortKeyType: { type: "string", enum: ["S", "N", "B"], description: "Type of sort key (optional)" },
-            readCapacity: { type: "number", description: "Provisioned read capacity units" },
-            writeCapacity: { type: "number", description: "Provisioned write capacity units" },
-        },
-        required: ["tableName", "partitionKey", "partitionKeyType", "readCapacity", "writeCapacity"],
-    },
-};
 const DYNAMODB_LIST_TABLES_TOOL = {
     name: "dynamodb:list_tables",
     description: "Lists all DynamoDB tables in the account",
@@ -53,18 +35,6 @@ const DYNAMODB_DESCRIBE_TABLE_TOOL = {
         required: ["tableName"],
     },
 };
-const DYNAMODB_PUT_ITEM_TOOL = {
-    name: "dynamodb:put_item",
-    description: "Inserts or replaces an item in a table",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table" },
-            item: { type: "object", description: "Item to put into the table" },
-        },
-        required: ["tableName", "item"],
-    },
-};
 const DYNAMODB_GET_ITEM_TOOL = {
     name: "dynamodb:get_item",
     description: "Retrieves an item from a table by its primary key",
@@ -73,39 +43,6 @@ const DYNAMODB_GET_ITEM_TOOL = {
         properties: {
             tableName: { type: "string", description: "Name of the table" },
             key: { type: "object", description: "Primary key of the item to retrieve" },
-        },
-        required: ["tableName", "key"],
-    },
-};
-const DYNAMODB_UPDATE_ITEM_TOOL = {
-    name: "dynamodb:update_item",
-    description: "Updates specific attributes of an item in a table",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table" },
-            key: { type: "object", description: "Primary key of the item to update" },
-            updateExpression: { type: "string", description: "Update expression (e.g., 'SET #n = :name')" },
-            expressionAttributeNames: { type: "object", description: "Attribute name mappings" },
-            expressionAttributeValues: { type: "object", description: "Values for the update expression" },
-            conditionExpression: { type: "string", description: "Condition for update (optional)" },
-            returnValues: { type: "string", enum: ["NONE", "ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATED_NEW"], description: "What values to return" },
-        },
-        required: ["tableName", "key", "updateExpression", "expressionAttributeNames", "expressionAttributeValues"],
-    },
-};
-const DYNAMODB_DELETE_ITEM_TOOL = {
-    name: "dynamodb:delete_item",
-    description: "Deletes an item from a table by its primary key",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table" },
-            key: { type: "object", description: "Primary key of the item to delete" },
-            conditionExpression: { type: "string", description: "Condition for deletion (optional)" },
-            expressionAttributeNames: { type: "object", description: "Attribute name mappings (optional)" },
-            expressionAttributeValues: { type: "object", description: "Values for condition expression (optional)" },
-            returnValues: { type: "string", enum: ["NONE", "ALL_OLD"], description: "What values to return" },
         },
         required: ["tableName", "key"],
     },
@@ -142,73 +79,6 @@ const DYNAMODB_SCAN_TABLE_TOOL = {
             indexName: { type: "string", description: "Name of the index to scan (optional)" },
         },
         required: ["tableName"],
-    },
-};
-const DYNAMODB_UPDATE_CAPACITY_TOOL = {
-    name: "dynamodb:update_capacity",
-    description: "Updates the provisioned capacity of a table",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table" },
-            readCapacity: { type: "number", description: "New read capacity units" },
-            writeCapacity: { type: "number", description: "New write capacity units" },
-        },
-        required: ["tableName", "readCapacity", "writeCapacity"],
-    },
-};
-const DYNAMODB_CREATE_GSI_TOOL = {
-    name: "dynamodb:create_gsi",
-    description: "Creates a global secondary index on a table",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table" },
-            indexName: { type: "string", description: "Name of the new index" },
-            partitionKey: { type: "string", description: "Partition key for the index" },
-            partitionKeyType: { type: "string", enum: ["S", "N", "B"], description: "Type of partition key" },
-            sortKey: { type: "string", description: "Sort key for the index (optional)" },
-            sortKeyType: { type: "string", enum: ["S", "N", "B"], description: "Type of sort key (optional)" },
-            projectionType: { type: "string", enum: ["ALL", "KEYS_ONLY", "INCLUDE"], description: "Type of projection" },
-            nonKeyAttributes: { type: "array", items: { type: "string" }, description: "Non-key attributes to project (optional)" },
-            readCapacity: { type: "number", description: "Provisioned read capacity units" },
-            writeCapacity: { type: "number", description: "Provisioned write capacity units" },
-        },
-        required: ["tableName", "indexName", "partitionKey", "partitionKeyType", "projectionType", "readCapacity", "writeCapacity"],
-    },
-};
-const DYNAMODB_UPDATE_GSI_TOOL = {
-    name: "dynamodb:update_gsi",
-    description: "Updates the provisioned capacity of a global secondary index",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table" },
-            indexName: { type: "string", description: "Name of the index to update" },
-            readCapacity: { type: "number", description: "New read capacity units" },
-            writeCapacity: { type: "number", description: "New write capacity units" },
-        },
-        required: ["tableName", "indexName", "readCapacity", "writeCapacity"],
-    },
-};
-const DYNAMODB_CREATE_LSI_TOOL = {
-    name: "dynamodb:create_lsi",
-    description: "Creates a local secondary index on a table (must be done during table creation)",
-    inputSchema: {
-        type: "object",
-        properties: {
-            tableName: { type: "string", description: "Name of the table" },
-            indexName: { type: "string", description: "Name of the new index" },
-            partitionKey: { type: "string", description: "Partition key for the table" },
-            partitionKeyType: { type: "string", enum: ["S", "N", "B"], description: "Type of partition key" },
-            sortKey: { type: "string", description: "Sort key for the index" },
-            sortKeyType: { type: "string", enum: ["S", "N", "B"], description: "Type of sort key" },
-            projectionType: { type: "string", enum: ["ALL", "KEYS_ONLY", "INCLUDE"], description: "Type of projection" },
-            nonKeyAttributes: { type: "array", items: { type: "string" }, description: "Non-key attributes to project (optional)" },
-            readCapacity: { type: "number", description: "Provisioned read capacity units (optional, default: 5)" },
-            writeCapacity: { type: "number", description: "Provisioned write capacity units (optional, default: 5)" },
-        },
-        required: ["tableName", "indexName", "partitionKey", "partitionKeyType", "sortKey", "sortKeyType", "projectionType"],
     },
 };
 // Enhanced utility functions
@@ -298,122 +168,6 @@ function fixItemKeyTypes(item, tableSchema) {
     });
     return fixedItem;
 }
-// Enhanced implementation functions with better error handling and intelligence
-async function createTable(params) {
-    try {
-        // Validate table name
-        if (!params.tableName || params.tableName.length < 3 || params.tableName.length > 255) {
-            return {
-                success: false,
-                message: "Table name must be between 3 and 255 characters",
-            };
-        }
-        const command = new CreateTableCommand({
-            TableName: params.tableName,
-            AttributeDefinitions: [
-                { AttributeName: params.partitionKey, AttributeType: params.partitionKeyType },
-                ...(params.sortKey ? [{ AttributeName: params.sortKey, AttributeType: params.sortKeyType }] : []),
-            ],
-            KeySchema: [
-                { AttributeName: params.partitionKey, KeyType: "HASH" },
-                ...(params.sortKey ? [{ AttributeName: params.sortKey, KeyType: "RANGE" }] : []),
-            ],
-            ProvisionedThroughput: {
-                ReadCapacityUnits: Math.max(1, params.readCapacity),
-                WriteCapacityUnits: Math.max(1, params.writeCapacity),
-            },
-        });
-        const response = await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `Table ${params.tableName} created successfully. Status: ${response.TableDescription?.TableStatus}`,
-            details: response.TableDescription,
-        };
-    }
-    catch (error) {
-        console.error("Error creating GSI:", error);
-        return {
-            success: false,
-            message: `Failed to create GSI: ${error.message || error}`,
-        };
-    }
-}
-async function updateGSI(params) {
-    try {
-        const command = new UpdateTableCommand({
-            TableName: params.tableName,
-            GlobalSecondaryIndexUpdates: [
-                {
-                    Update: {
-                        IndexName: params.indexName,
-                        ProvisionedThroughput: {
-                            ReadCapacityUnits: Math.max(1, params.readCapacity),
-                            WriteCapacityUnits: Math.max(1, params.writeCapacity),
-                        },
-                    },
-                },
-            ],
-        });
-        const response = await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `GSI ${params.indexName} capacity updated on table ${params.tableName}`,
-            details: response.TableDescription,
-        };
-    }
-    catch (error) {
-        console.error("Error updating GSI:", error);
-        return {
-            success: false,
-            message: `Failed to update GSI: ${error.message || error}`,
-        };
-    }
-}
-async function createLSI(params) {
-    try {
-        // Note: LSIs must be created during table creation
-        const command = new CreateTableCommand({
-            TableName: params.tableName,
-            AttributeDefinitions: [
-                { AttributeName: params.partitionKey, AttributeType: params.partitionKeyType },
-                { AttributeName: params.sortKey, AttributeType: params.sortKeyType },
-            ],
-            KeySchema: [
-                { AttributeName: params.partitionKey, KeyType: "HASH" },
-            ],
-            LocalSecondaryIndexes: [
-                {
-                    IndexName: params.indexName,
-                    KeySchema: [
-                        { AttributeName: params.partitionKey, KeyType: "HASH" },
-                        { AttributeName: params.sortKey, KeyType: "RANGE" },
-                    ],
-                    Projection: {
-                        ProjectionType: params.projectionType,
-                        ...(params.projectionType === "INCLUDE" ? { NonKeyAttributes: params.nonKeyAttributes } : {}),
-                    },
-                },
-            ],
-            ProvisionedThroughput: {
-                ReadCapacityUnits: Math.max(1, params.readCapacity || 5),
-                WriteCapacityUnits: Math.max(1, params.writeCapacity || 5),
-            },
-        });
-        const response = await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `LSI ${params.indexName} created on table ${params.tableName}`,
-            details: response.TableDescription,
-        };
-    }
-    catch (error) {
-        console.error("Error creating LSI:", error);
-        return {
-            success: false,
-            message: `Failed to create LSI: ${error.message || error}`,
-        };
-    }
-}
 // Enhanced server setup with better organization
 const server = new Server({
     name: "dynamodb-mcp-server",
@@ -427,17 +181,9 @@ const server = new Server({
 const ALL_TOOLS = [
     DYNAMODB_LIST_TABLES_TOOL,
     DYNAMODB_DESCRIBE_TABLE_TOOL,
-    DYNAMODB_CREATE_TABLE_TOOL,
-    DYNAMODB_UPDATE_CAPACITY_TOOL,
-    DYNAMODB_PUT_ITEM_TOOL,
     DYNAMODB_GET_ITEM_TOOL,
-    DYNAMODB_UPDATE_ITEM_TOOL,
-    DYNAMODB_DELETE_ITEM_TOOL,
     DYNAMODB_QUERY_TABLE_TOOL,
     DYNAMODB_SCAN_TABLE_TOOL,
-    DYNAMODB_CREATE_GSI_TOOL,
-    DYNAMODB_UPDATE_GSI_TOOL,
-    DYNAMODB_CREATE_LSI_TOOL,
 ];
 // Request handlers
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -455,38 +201,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case "dynamodb:describe_table":
                 result = await describeTable(args);
                 break;
-            case "dynamodb:create_table":
-                result = await createTable(args);
-                break;
-            case "dynamodb:update_capacity":
-                result = await updateCapacity(args);
-                break;
-            case "dynamodb:put_item":
-                result = await putItem(args);
-                break;
             case "dynamodb:get_item":
                 result = await getItem(args);
-                break;
-            case "dynamodb:update_item":
-                result = await updateItem(args);
-                break;
-            case "dynamodb:delete_item":
-                result = await deleteItem(args);
                 break;
             case "dynamodb:query_table":
                 result = await queryTable(args);
                 break;
             case "dynamodb:scan_table":
                 result = await scanTable(args);
-                break;
-            case "dynamodb:create_gsi":
-                result = await createGSI(args);
-                break;
-            case "dynamodb:update_gsi":
-                result = await updateGSI(args);
-                break;
-            case "dynamodb:create_lsi":
-                result = await createLSI(args);
                 break;
             default:
                 return {
@@ -618,30 +340,6 @@ async function describeTable(params) {
         };
     }
 }
-async function putItem(params) {
-    try {
-        const tableSchema = await getTableSchema(params.tableName);
-        const fixedItem = fixItemKeyTypes(params.item, tableSchema);
-        const command = new PutItemCommand({
-            TableName: params.tableName,
-            Item: marshall(fixedItem),
-        });
-        await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `Item added successfully to table ${params.tableName}`,
-            item: fixedItem,
-        };
-    }
-    catch (error) {
-        console.error("Error putting item:", error);
-        return {
-            success: false,
-            message: `Failed to put item: ${error.message || error}`,
-            errorType: error.name,
-        };
-    }
-}
 async function getItem(params) {
     try {
         const tableSchema = await getTableSchema(params.tableName);
@@ -665,65 +363,6 @@ async function getItem(params) {
         return {
             success: false,
             message: `Failed to get item: ${error.message || error}`,
-        };
-    }
-}
-async function updateItem(params) {
-    try {
-        const tableSchema = await getTableSchema(params.tableName);
-        const fixedKey = fixItemKeyTypes(params.key, tableSchema);
-        const normalizedValues = normalizeAttributeValues(params.expressionAttributeValues);
-        const command = new UpdateItemCommand({
-            TableName: params.tableName,
-            Key: marshall(fixedKey),
-            UpdateExpression: params.updateExpression,
-            ExpressionAttributeNames: params.expressionAttributeNames,
-            ExpressionAttributeValues: normalizedValues ? marshall(normalizedValues) : undefined,
-            ConditionExpression: params.conditionExpression,
-            ReturnValues: params.returnValues || "NONE",
-        });
-        const response = await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `Item updated successfully in table ${params.tableName}`,
-            attributes: response.Attributes ? unmarshall(response.Attributes) : null,
-        };
-    }
-    catch (error) {
-        console.error("Error updating item:", error);
-        return {
-            success: false,
-            message: `Failed to update item: ${error.message || error}`,
-            errorType: error.name,
-        };
-    }
-}
-async function deleteItem(params) {
-    try {
-        const tableSchema = await getTableSchema(params.tableName);
-        const fixedKey = fixItemKeyTypes(params.key, tableSchema);
-        const normalizedValues = normalizeAttributeValues(params.expressionAttributeValues);
-        const command = new DeleteItemCommand({
-            TableName: params.tableName,
-            Key: marshall(fixedKey),
-            ConditionExpression: params.conditionExpression,
-            ExpressionAttributeNames: params.expressionAttributeNames,
-            ExpressionAttributeValues: normalizedValues ? marshall(normalizedValues) : undefined,
-            ReturnValues: params.returnValues || "NONE",
-        });
-        const response = await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `Item deleted successfully from table ${params.tableName}`,
-            attributes: response.Attributes ? unmarshall(response.Attributes) : null,
-        };
-    }
-    catch (error) {
-        console.error("Error deleting item:", error);
-        return {
-            success: false,
-            message: `Failed to delete item: ${error.message || error}`,
-            errorType: error.name,
         };
     }
 }
@@ -823,73 +462,6 @@ async function scanTable(params) {
             message: `Failed to scan table: ${error.message || error}`,
             items: [],
             errorType: error.name,
-        };
-    }
-}
-async function updateCapacity(params) {
-    try {
-        const command = new UpdateTableCommand({
-            TableName: params.tableName,
-            ProvisionedThroughput: {
-                ReadCapacityUnits: Math.max(1, params.readCapacity),
-                WriteCapacityUnits: Math.max(1, params.writeCapacity),
-            },
-        });
-        const response = await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `Capacity updated successfully for table ${params.tableName}`,
-            details: response.TableDescription,
-        };
-    }
-    catch (error) {
-        console.error("Error updating capacity:", error);
-        return {
-            success: false,
-            message: `Failed to update capacity: ${error.message || error}`,
-        };
-    }
-}
-async function createGSI(params) {
-    try {
-        const command = new UpdateTableCommand({
-            TableName: params.tableName,
-            AttributeDefinitions: [
-                { AttributeName: params.partitionKey, AttributeType: params.partitionKeyType },
-                ...(params.sortKey ? [{ AttributeName: params.sortKey, AttributeType: params.sortKeyType }] : []),
-            ],
-            GlobalSecondaryIndexUpdates: [
-                {
-                    Create: {
-                        IndexName: params.indexName,
-                        KeySchema: [
-                            { AttributeName: params.partitionKey, KeyType: "HASH" },
-                            ...(params.sortKey ? [{ AttributeName: params.sortKey, KeyType: "RANGE" }] : []),
-                        ],
-                        Projection: {
-                            ProjectionType: params.projectionType,
-                            ...(params.projectionType === "INCLUDE" ? { NonKeyAttributes: params.nonKeyAttributes } : {}),
-                        },
-                        ProvisionedThroughput: {
-                            ReadCapacityUnits: Math.max(1, params.readCapacity),
-                            WriteCapacityUnits: Math.max(1, params.writeCapacity),
-                        },
-                    },
-                },
-            ],
-        });
-        const response = await dynamoClient.send(command);
-        return {
-            success: true,
-            message: `GSI ${params.indexName} creation initiated on table ${params.tableName}`,
-            details: response.TableDescription,
-        };
-    }
-    catch (error) {
-        console.error("Error creating GSI:", error);
-        return {
-            success: false,
-            message: `Failed to create GSI: ${error.message || error}`,
         };
     }
 }

@@ -5,12 +5,23 @@ import readline from "readline/promises";
 import dotenv from "dotenv";
 import express from "express";
 import bodyParser from "body-parser";
-dotenv.config();
-// Check for AWS region
+// Load environment variables with explicit path
+const envResult = dotenv.config({ path: '.env' });
+console.log('dotenv config result:', envResult);
+// Check for AWS region with better debugging
 const AWS_REGION = process.env.AWS_REGION;
+console.log('All environment variables:', {
+    AWS_REGION: process.env.AWS_REGION,
+    NODE_ENV: process.env.NODE_ENV,
+    PORT: process.env.PORT
+});
 if (!AWS_REGION) {
-    throw new Error("AWS_REGION is not set in .env file");
+    console.error("Environment variables check failed:");
+    console.error("AWS_REGION:", process.env.AWS_REGION);
+    console.error("All env keys:", Object.keys(process.env).filter(key => key.startsWith('AWS')));
+    throw new Error("AWS_REGION is not set in environment variables");
 }
+console.log(`Using AWS Region: ${AWS_REGION}`);
 class EnhancedMCPClient {
     mcp;
     bedrockClient;
@@ -88,13 +99,16 @@ class EnhancedMCPClient {
     sanitizeToolName(name) {
         return name.replace(/[^a-zA-Z0-9_-]/g, '_');
     }
-    async processQuery(query) {
-        // Add user message to conversation history
+    async processQuery(query, stateless = false) {
         const userMessage = {
             role: "user",
             content: [{ type: "text", text: query }]
         };
-        this.conversationHistory.push(userMessage);
+        // For stateless requests, do NOT use or push to conversationHistory
+        const messages = stateless ? [userMessage] : (() => {
+            this.conversationHistory.push(userMessage);
+            return [...this.conversationHistory];
+        })();
         // Prepare tools for Bedrock format
         const toolsForBedrock = this.tools.length > 0 ? {
             tools: this.tools.map(tool => ({
@@ -109,9 +123,9 @@ class EnhancedMCPClient {
             max_tokens: 2000,
             top_k: 250,
             stop_sequences: [],
-            temperature: 0.1, // Lower temperature for more consistent responses
+            temperature: 0.1,
             top_p: 0.999,
-            messages: [...this.conversationHistory],
+            messages,
             ...toolsForBedrock
         };
         const commandParams = {
@@ -127,9 +141,98 @@ class EnhancedMCPClient {
         try {
             const response = await this.bedrockClient.send(command);
             const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+            // For stateless requests, handle tool calls with a follow-up request
+            if (stateless) {
+                let finalText = [];
+                let toolUseContent = null;
+                let toolResultContent = null;
+                let toolUseId;
+                for (const content of responseBody.content) {
+                    if (content.type === "text") {
+                        finalText.push(content.text);
+                    }
+                    else if (content.type === "tool_use") {
+                        toolUseContent = content;
+                        toolUseId = content.id;
+                        // Execute the tool
+                        const optimized = this.optimizeQuery(content.name, content.input);
+                        const sanitizedToolName = this.sanitizeToolName(optimized.name);
+                        const mcpToolName = this.sanitizedToOriginalToolName[sanitizedToolName] || optimized.name;
+                        let result;
+                        try {
+                            result = await this.mcp.callTool({
+                                name: mcpToolName,
+                                arguments: optimized.args,
+                            });
+                        }
+                        catch (err) {
+                            return `❌ Tool ${sanitizedToolName} failed: ${err}`;
+                        }
+                        // Parse tool result
+                        let parsedResult = null;
+                        let resultText = "";
+                        try {
+                            if (typeof result.content === "string") {
+                                parsedResult = JSON.parse(result.content);
+                            }
+                            else if (Array.isArray(result.content) && result.content.length > 0 && typeof result.content[0]?.text === "string") {
+                                parsedResult = JSON.parse(result.content[0].text);
+                            }
+                        }
+                        catch (parseError) { }
+                        if (parsedResult) {
+                            resultText = JSON.stringify(parsedResult, null, 2);
+                        }
+                        toolResultContent = {
+                            type: "tool_result",
+                            tool_use_id: toolUseId,
+                            content: resultText
+                        };
+                        // Now, send a follow-up request with the correct alternation:
+                        const followUpMessages = [
+                            userMessage,
+                            { role: "assistant", content: [toolUseContent] },
+                            { role: "user", content: [toolResultContent] }
+                        ];
+                        const followUpPayload = {
+                            anthropic_version: "bedrock-2023-05-31",
+                            max_tokens: 1000,
+                            top_k: 250,
+                            stop_sequences: [],
+                            temperature: 0.1,
+                            top_p: 0.999,
+                            messages: followUpMessages,
+                            tools: this.tools.map(tool => ({
+                                name: this.sanitizeToolName(tool.name),
+                                description: tool.description || "",
+                                input_schema: tool.input_schema
+                            }))
+                        };
+                        const followUpCommandParams = {
+                            modelId: this.modelId,
+                            contentType: "application/json",
+                            accept: "application/json",
+                            body: JSON.stringify(followUpPayload)
+                        };
+                        if (this.inferenceProfileId) {
+                            followUpCommandParams.inferenceProfileArn = this.inferenceProfileId;
+                        }
+                        const followUpCommand = new InvokeModelCommand(followUpCommandParams);
+                        const followUpResponse = await this.bedrockClient.send(followUpCommand);
+                        const followUpBody = JSON.parse(new TextDecoder().decode(followUpResponse.body));
+                        // Return only the assistant's final text
+                        for (const followContent of followUpBody.content) {
+                            if (followContent.type === "text") {
+                                finalText.push(followContent.text);
+                            }
+                        }
+                    }
+                }
+                return finalText.join("\n");
+            }
+            // ...existing code for non-stateless (chat) usage
             const finalText = [];
             const assistantContent = [];
-            // Process the response content
             for (const content of responseBody.content) {
                 if (content.type === "text") {
                     finalText.push(content.text);
@@ -180,7 +283,7 @@ class EnhancedMCPClient {
                     }
                     if (parsedResult) {
                         resultText = JSON.stringify(parsedResult, null, 2);
-                        // Display results in a user-friendly way
+                        // Display results in a user-friendly way (console)
                         if (parsedResult.success) {
                             console.log(`✅ ${parsedResult.message}`);
                             if (parsedResult.items && Array.isArray(parsedResult.items)) {
@@ -202,56 +305,12 @@ class EnhancedMCPClient {
                                 console.log(`🔍 Error Type: ${parsedResult.errorType}`);
                             }
                         }
-                    }
-                    // Add tool result to conversation (do NOT include name)
-                    const toolResultContent = {
-                        role: "user",
-                        content: [{
-                                type: "tool_result",
-                                tool_use_id: content.id,
-                                content: resultText
-                            }]
-                    };
-                    // Update conversation history
-                    this.conversationHistory.push({
-                        role: "assistant",
-                        content: assistantContent
-                    });
-                    this.conversationHistory.push(toolResultContent);
-                    // Create follow-up request to get the model's interpretation
-                    const followUpPayload = {
-                        anthropic_version: "bedrock-2023-05-31",
-                        max_tokens: 1000,
-                        top_k: 250,
-                        stop_sequences: [],
-                        temperature: 0.1,
-                        top_p: 0.999,
-                        messages: [...this.conversationHistory],
-                        tools: toolsForBedrock.tools
-                    };
-                    const followUpCommandParams = {
-                        modelId: this.modelId,
-                        contentType: "application/json",
-                        accept: "application/json",
-                        body: JSON.stringify(followUpPayload)
-                    };
-                    if (this.inferenceProfileId) {
-                        followUpCommandParams.inferenceProfileArn = this.inferenceProfileId;
-                    }
-                    const followUpCommand = new InvokeModelCommand(followUpCommandParams);
-                    const followUpResponse = await this.bedrockClient.send(followUpCommand);
-                    const followUpBody = JSON.parse(new TextDecoder().decode(followUpResponse.body));
-                    if (followUpBody.content && followUpBody.content[0] && followUpBody.content[0].type === "text") {
-                        const interpretationText = followUpBody.content[0].text;
-                        finalText.push(interpretationText);
-                        // Add the follow-up response to conversation history
-                        this.conversationHistory.push({
-                            role: "assistant",
-                            content: [{ type: "text", text: interpretationText }]
-                        });
+                        // Always add resultText to finalText for endpoint response
+                        finalText.push(resultText);
                     }
                 }
             }
+            // For stateless requests, do not update conversationHistory
             return finalText.join("\n");
         }
         catch (error) {
@@ -315,6 +374,10 @@ class EnhancedMCPClient {
             console.error("❌ Error closing MCP connection:", error);
         }
     }
+    // Add this method
+    resetConversationHistory() {
+        this.conversationHistory = [];
+    }
 }
 let mcpClientInstance = null;
 export async function initMCPClient(serverScriptPath, inferenceProfileId) {
@@ -324,11 +387,11 @@ export async function initMCPClient(serverScriptPath, inferenceProfileId) {
     }
     return mcpClientInstance;
 }
-export async function mcpProcessQuery(query) {
+export async function mcpProcessQuery(query, stateless = false) {
     if (!mcpClientInstance) {
         throw new Error("MCP client not initialized. Call initMCPClient first.");
     }
-    return await mcpClientInstance.processQuery(query);
+    return await mcpClientInstance.processQuery(query, stateless);
 }
 async function startEndpoint(serverScriptPath, inferenceProfileId) {
     const mcpClient = new EnhancedMCPClient(inferenceProfileId);
@@ -336,6 +399,8 @@ async function startEndpoint(serverScriptPath, inferenceProfileId) {
     const app = express();
     app.use(bodyParser.json());
     app.post("/query", async (req, res) => {
+        // Reset conversation history for every request to ensure statelessness
+        mcpClient.resetConversationHistory();
         const { query } = req.body;
         if (!query || typeof query !== "string") {
             return res.status(400).json({ error: "Missing or invalid 'query' field in request body." });
